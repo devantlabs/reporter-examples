@@ -4,19 +4,33 @@ on:
   workflow_dispatch:
     inputs:
       workers:
-        description: "Parallel workers (each = 4vCPU/16GB ubuntu-24.04, same as mattermost CI)"
+        description: "Parallel workers (ubuntu-24.04 = 4vCPU/16GB each, same as mattermost CI)"
         default: "20"
         required: false
 
 jobs:
-  # ── 1. Create one Devant run + generate spec shards ────────────────────────
+  # ── 1. Create one Devant run + shard specs ─────────────────────────────────
   begin:
     runs-on: ubuntu-24.04
     outputs:
       run_id: ${{ steps.create_run.outputs.run_id }}
       matrix: ${{ steps.shard.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Clone mattermost/mattermost (depth 1)
+        run: git clone --depth 1 https://github.com/mattermost/mattermost mattermost
+
+      - name: Install Devant reporter into mattermost cypress
+        run: cd mattermost/e2e-tests/cypress && npm install -D @devant-net/cypress-reporter@0.1.5
+
+      - name: Patch cypress.config.ts — wire devqReporter after plugins
+        run: |
+          cd mattermost/e2e-tests/cypress
+          # Add import
+          sed -i "s|import {defineConfig} from 'cypress';|import {defineConfig} from 'cypress';\nimport {devqReporter} from '@devant-net/cypress-reporter';|" cypress.config.ts
+          # Wire after plugins (MUST be last so after:spec wins)
+          sed -i "s|return require('./tests/plugins/index.js')(on, config);|const cfg = require('./tests/plugins/index.js')(on, config);\n            devqReporter(on, cfg || config);\n            return cfg;|" cypress.config.ts
+          echo "Patched cypress.config.ts:"
+          grep -n "devqReporter\|devant" cypress.config.ts
 
       - name: Create Devant run
         id: create_run
@@ -32,13 +46,28 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
 
-      - name: Generate spec shards
+      - name: Shard @prod specs
         id: shard
+        working-directory: mattermost/e2e-tests/cypress
         run: |
-          cd e2e-tests/cypress
-          node shard.js ${{ github.event.inputs.workers }} >> "$GITHUB_OUTPUT"
+          node - ${{ github.event.inputs.workers }} >> "$GITHUB_OUTPUT" <<'EOF'
+          const { execSync } = require('child_process');
+          const n = parseInt(process.argv[2] || '20', 10);
+          const files = execSync(
+            'grep -rlE "Stage:.*@prod|@prod" tests/integration 2>/dev/null | sort',
+            { encoding: 'utf8' }
+          ).trim().split('\n').filter(Boolean);
+          process.stderr.write(`${files.length} @prod specs → ${n} workers\n`);
+          const size = Math.ceil(files.length / n);
+          const chunks = [];
+          for (let i = 0; i < n; i++) {
+            const chunk = files.slice(i * size, (i + 1) * size);
+            if (chunk.length) chunks.push({ index: i + 1, specs: chunk.join(',') });
+          }
+          process.stdout.write(`matrix=${JSON.stringify(chunks)}\n`);
+          EOF
 
-  # ── 2. N workers — each own full stack → same Devant run ───────────────────
+  # ── 2. N workers — each own mattermost stack → same Devant run ─────────────
   workers:
     needs: begin
     runs-on: ubuntu-24.04
@@ -55,7 +84,17 @@ jobs:
       CI_BASE_URL: worker-${{ matrix.index }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Clone mattermost/mattermost (depth 1)
+        run: git clone --depth 1 https://github.com/mattermost/mattermost mattermost
+
+      - name: Install Devant reporter
+        run: cd mattermost/e2e-tests/cypress && npm install -D @devant-net/cypress-reporter@0.1.5
+
+      - name: Patch cypress.config.ts
+        run: |
+          cd mattermost/e2e-tests/cypress
+          sed -i "s|import {defineConfig} from 'cypress';|import {defineConfig} from 'cypress';\nimport {devqReporter} from '@devant-net/cypress-reporter';|" cypress.config.ts
+          sed -i "s|return require('./tests/plugins/index.js')(on, config);|const cfg = require('./tests/plugins/index.js')(on, config);\n            devqReporter(on, cfg || config);\n            return cfg;|" cypress.config.ts
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -63,22 +102,22 @@ jobs:
       - name: Cache cypress deps
         uses: actions/cache@v4
         with:
-          path: e2e-tests/cypress/node_modules
-          key: cypress-${{ runner.os }}-${{ hashFiles('e2e-tests/cypress/package-lock.json') }}
+          path: mattermost/e2e-tests/cypress/node_modules
+          key: cypress-${{ runner.os }}-${{ hashFiles('mattermost/e2e-tests/cypress/package-lock.json') }}
 
-      - name: Install deps
-        run: cd e2e-tests/cypress && npm ci
+      - name: Install cypress deps
+        run: cd mattermost/e2e-tests/cypress && npm ci
 
       - name: Pre-pull server image
         run: docker pull $SERVER_IMAGE &
 
       - name: Start mattermost stack
-        run: cd e2e-tests && SERVER_IMAGE=$SERVER_IMAGE make start-server
+        run: cd mattermost/e2e-tests && SERVER_IMAGE=$SERVER_IMAGE make start-server
         timeout-minutes: 10
 
       - name: Run shard → Devant run #${{ needs.begin.outputs.run_id }}
         run: |
-          cd e2e-tests/cypress
+          cd mattermost/e2e-tests/cypress
           npx cypress run \
             --spec "${{ matrix.specs }}" \
             --config "videosFolder=/tmp/vid-${{ matrix.index }},screenshotsFolder=/tmp/ss-${{ matrix.index }}"
@@ -86,7 +125,7 @@ jobs:
 
       - name: Stop stack
         if: always()
-        run: cd e2e-tests && make stop || true
+        run: cd mattermost/e2e-tests && make stop || true
 
   # ── 3. Complete the Devant run ─────────────────────────────────────────────
   finish:
@@ -94,7 +133,7 @@ jobs:
     runs-on: ubuntu-24.04
     if: always()
     steps:
-      - name: Complete Devant run
+      - name: Complete Devant run #${{ needs.begin.outputs.run_id }}
         run: |
           curl -sf -X POST "${{ secrets.DEVANT_CLOUD_API_URL }}/v1/runs/${{ needs.begin.outputs.run_id }}/complete" \
             -H "Authorization: Bearer ${{ secrets.DEVANT_CLOUD_TOKEN }}" \
