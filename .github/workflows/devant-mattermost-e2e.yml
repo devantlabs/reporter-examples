@@ -165,6 +165,11 @@ jobs:
       - name: Pre-pull server image
         run: docker pull $SERVER_IMAGE &
 
+      - name: Create missing dashboard stub (server.generate.sh expects it)
+        run: |
+          mkdir -p mattermost/e2e-tests/.ci/dashboard/docker
+          echo "version: '3'" > mattermost/e2e-tests/.ci/dashboard/docker/docker-compose.yml
+
       - name: Start mattermost stack
         run: cd mattermost/e2e-tests && SERVER_IMAGE=$SERVER_IMAGE make start-server
         timeout-minutes: 10
