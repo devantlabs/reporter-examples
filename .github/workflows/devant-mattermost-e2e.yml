@@ -24,13 +24,25 @@ jobs:
 
       - name: Patch cypress.config.ts — wire devqReporter after plugins
         run: |
-          cd mattermost/e2e-tests/cypress
-          # Add import
-          sed -i "s|import {defineConfig} from 'cypress';|import {defineConfig} from 'cypress';\nimport {devqReporter} from '@devant-net/cypress-reporter';|" cypress.config.ts
-          # Wire after plugins (MUST be last so after:spec wins)
-          sed -i "s|return require('./tests/plugins/index.js')(on, config);|const cfg = require('./tests/plugins/index.js')(on, config);\n            devqReporter(on, cfg || config);\n            return cfg;|" cypress.config.ts
-          echo "Patched cypress.config.ts:"
-          grep -n "devqReporter\|devant" cypress.config.ts
+          python3 - mattermost/e2e-tests/cypress/cypress.config.ts <<'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          # Add import after the cypress import
+          imp = "import {defineConfig} from 'cypress';"
+          assert imp in s, f"anchor not found: {imp}"
+          s = s.replace(imp, imp + "\nimport {devqReporter} from '@devant-net/cypress-reporter';", 1)
+          # Wire devqReporter AFTER mattermost's plugins (so its after:spec wins)
+          ret = "return require('./tests/plugins/index.js')(on, config);"
+          assert ret in s, f"anchor not found: {ret}"
+          s = s.replace(ret,
+            "const cfg = require('./tests/plugins/index.js')(on, config);\n"
+            "            devqReporter(on, cfg || config); // Devant reporter LAST\n"
+            "            return cfg;", 1)
+          open(p, 'w').write(s)
+          print("patched:", p)
+          PY
+          grep -n "devqReporter\|devant" mattermost/e2e-tests/cypress/cypress.config.ts
 
       - name: Create Devant run
         id: create_run
@@ -92,9 +104,17 @@ jobs:
 
       - name: Patch cypress.config.ts
         run: |
-          cd mattermost/e2e-tests/cypress
-          sed -i "s|import {defineConfig} from 'cypress';|import {defineConfig} from 'cypress';\nimport {devqReporter} from '@devant-net/cypress-reporter';|" cypress.config.ts
-          sed -i "s|return require('./tests/plugins/index.js')(on, config);|const cfg = require('./tests/plugins/index.js')(on, config);\n            devqReporter(on, cfg || config);\n            return cfg;|" cypress.config.ts
+          python3 - mattermost/e2e-tests/cypress/cypress.config.ts <<'PY'
+          import sys
+          p = sys.argv[1]; s = open(p).read()
+          s = s.replace("import {defineConfig} from 'cypress';",
+            "import {defineConfig} from 'cypress';\nimport {devqReporter} from '@devant-net/cypress-reporter';", 1)
+          s = s.replace("return require('./tests/plugins/index.js')(on, config);",
+            "const cfg = require('./tests/plugins/index.js')(on, config);\n"
+            "            devqReporter(on, cfg || config);\n"
+            "            return cfg;", 1)
+          open(p, 'w').write(s)
+          PY
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
