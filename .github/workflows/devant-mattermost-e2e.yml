@@ -56,7 +56,7 @@ jobs:
           echo "Created Devant run #$RID"
 
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with: { node-version: 24 }
 
       - name: Shard @prod specs
         id: shard
@@ -117,7 +117,7 @@ jobs:
           PY
 
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with: { node-version: 24 }
 
       - name: Cache cypress deps
         uses: actions/cache@v4
