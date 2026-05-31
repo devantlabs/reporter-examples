@@ -5,7 +5,7 @@ on:
     inputs:
       workers:
         description: "Parallel workers (ubuntu-24.04 = 4vCPU/16GB each, same as mattermost CI)"
-        default: "20"
+        default: "40"
         required: false
 
 jobs:
