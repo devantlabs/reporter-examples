@@ -1,0 +1,103 @@
+name: Devant E2E — Mattermost Cypress
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: "Parallel workers (each = 4vCPU/16GB ubuntu-24.04, same as mattermost CI)"
+        default: "20"
+        required: false
+
+jobs:
+  # ── 1. Create one Devant run + generate spec shards ────────────────────────
+  begin:
+    runs-on: ubuntu-24.04
+    outputs:
+      run_id: ${{ steps.create_run.outputs.run_id }}
+      matrix: ${{ steps.shard.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Devant run
+        id: create_run
+        run: |
+          RID=$(curl -sf -X POST "${{ secrets.DEVANT_CLOUD_API_URL }}/v1/runs" \
+            -H "Authorization: Bearer ${{ secrets.DEVANT_CLOUD_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"project_id\":${{ secrets.DEVANT_CLOUD_PROJECT_ID }},\"mode\":\"automated\",\"name\":\"mattermost cypress @prod — ${{ github.run_id }}\",\"framework\":\"cypress\"}" \
+            | jq -r .id)
+          echo "run_id=$RID" >> "$GITHUB_OUTPUT"
+          echo "Created Devant run #$RID"
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - name: Generate spec shards
+        id: shard
+        run: |
+          cd e2e-tests/cypress
+          node shard.js ${{ github.event.inputs.workers }} >> "$GITHUB_OUTPUT"
+
+  # ── 2. N workers — each own full stack → same Devant run ───────────────────
+  workers:
+    needs: begin
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.begin.outputs.matrix) }}
+    env:
+      DEVANT_CLOUD_API_URL: ${{ secrets.DEVANT_CLOUD_API_URL }}
+      DEVANT_CLOUD_PROJECT_ID: ${{ secrets.DEVANT_CLOUD_PROJECT_ID }}
+      DEVANT_CLOUD_TOKEN: ${{ secrets.DEVANT_CLOUD_TOKEN }}
+      DEVANT_CLOUD_RUN_ID: ${{ needs.begin.outputs.run_id }}
+      SERVER_IMAGE: mattermostdevelopment/mattermost-team-edition:master
+      CI_BASE_URL: worker-${{ matrix.index }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - name: Cache cypress deps
+        uses: actions/cache@v4
+        with:
+          path: e2e-tests/cypress/node_modules
+          key: cypress-${{ runner.os }}-${{ hashFiles('e2e-tests/cypress/package-lock.json') }}
+
+      - name: Install deps
+        run: cd e2e-tests/cypress && npm ci
+
+      - name: Pre-pull server image
+        run: docker pull $SERVER_IMAGE &
+
+      - name: Start mattermost stack
+        run: cd e2e-tests && SERVER_IMAGE=$SERVER_IMAGE make start-server
+        timeout-minutes: 10
+
+      - name: Run shard → Devant run #${{ needs.begin.outputs.run_id }}
+        run: |
+          cd e2e-tests/cypress
+          npx cypress run \
+            --spec "${{ matrix.specs }}" \
+            --config "videosFolder=/tmp/vid-${{ matrix.index }},screenshotsFolder=/tmp/ss-${{ matrix.index }}"
+        timeout-minutes: 30
+
+      - name: Stop stack
+        if: always()
+        run: cd e2e-tests && make stop || true
+
+  # ── 3. Complete the Devant run ─────────────────────────────────────────────
+  finish:
+    needs: [begin, workers]
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Complete Devant run
+        run: |
+          curl -sf -X POST "${{ secrets.DEVANT_CLOUD_API_URL }}/v1/runs/${{ needs.begin.outputs.run_id }}/complete" \
+            -H "Authorization: Bearer ${{ secrets.DEVANT_CLOUD_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"status":"complete"}'
+          echo "✅ Run #${{ needs.begin.outputs.run_id }} complete"
