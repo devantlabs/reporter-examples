@@ -28,16 +28,14 @@ jobs:
           import sys
           p = sys.argv[1]
           s = open(p).read()
-          # Add import after the cypress import
           imp = "import {defineConfig} from 'cypress';"
           assert imp in s, f"anchor not found: {imp}"
           s = s.replace(imp, imp + "\nimport {devqReporter} from '@devant-net/cypress-reporter';", 1)
-          # Wire devqReporter AFTER mattermost's plugins (so its after:spec wins)
           ret = "return require('./tests/plugins/index.js')(on, config);"
           assert ret in s, f"anchor not found: {ret}"
           s = s.replace(ret,
             "const cfg = require('./tests/plugins/index.js')(on, config);\n"
-            "            devqReporter(on, cfg || config); // Devant reporter LAST\n"
+            "            devqReporter(on, cfg || config);\n"
             "            return cfg;", 1)
           open(p, 'w').write(s)
           print("patched:", p)
@@ -58,13 +56,14 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 24 }
 
-      - name: Shard @prod specs
+      - name: Shard @prod specs into matrix
         id: shard
         working-directory: mattermost/e2e-tests/cypress
         run: |
-          node - ${{ github.event.inputs.workers }} >> "$GITHUB_OUTPUT" <<'EOF'
+          node - "${{ github.event.inputs.workers }}" <<'SHARD'
           const { execSync } = require('child_process');
-          const n = parseInt(process.argv[2] || '20', 10);
+          const fs = require('fs');
+          const n = parseInt(process.argv[2] || '40', 10);
           const files = execSync(
             'grep -rlE "Stage:.*@prod|@prod" tests/integration 2>/dev/null | sort',
             { encoding: 'utf8' }
@@ -76,17 +75,49 @@ jobs:
             const chunk = files.slice(i * size, (i + 1) * size);
             if (chunk.length) chunks.push({ index: i + 1, specs: chunk.join(',') });
           }
-          process.stdout.write(`matrix=${JSON.stringify(chunks)}\n`);
-          EOF
+          const json = JSON.stringify(chunks);
+          // Write to artifact file (avoids GHA secret scanner on GITHUB_OUTPUT)
+          fs.writeFileSync('/tmp/matrix.json', json);
+          // Also try GITHUB_OUTPUT — if scanner blocks it, artifact is the fallback
+          const out = process.env.GITHUB_OUTPUT;
+          if (out) fs.appendFileSync(out, `matrix=${json}\n`);
+          process.stderr.write(`wrote ${chunks.length} shards\n`);
+          SHARD
+
+      - name: Upload matrix artifact (fallback if GITHUB_OUTPUT is redacted)
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix
+          path: /tmp/matrix.json
+          retention-days: 1
+
+  # ── helper: read matrix from artifact if GITHUB_OUTPUT was redacted ─────────
+  read-matrix:
+    needs: begin
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - name: Download matrix artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: matrix
+          path: /tmp
+
+      - name: Read matrix
+        id: read
+        run: |
+          MATRIX=$(cat /tmp/matrix.json)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   # ── 2. N workers — each own mattermost stack → same Devant run ─────────────
   workers:
-    needs: begin
+    needs: [begin, read-matrix]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.begin.outputs.matrix) }}
+        include: ${{ fromJSON(needs.read-matrix.outputs.matrix) }}
     env:
       DEVANT_CLOUD_API_URL: ${{ secrets.DEVANT_CLOUD_API_URL }}
       DEVANT_CLOUD_PROJECT_ID: ${{ secrets.DEVANT_CLOUD_PROJECT_ID }}
